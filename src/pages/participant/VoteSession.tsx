@@ -2,13 +2,14 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
-import { Mic, Image as ImageIcon, Plus, ThumbsUp, Star, MapPin, Phone, ArrowRight, X, Search, Sparkles, RotateCcw, Heart, XCircle } from "lucide-react"
+import { Mic, Image as ImageIcon, Plus, ThumbsUp, Star, MapPin, Phone, ArrowRight, X, Search, Sparkles, RotateCcw, Heart, XCircle, Loader2 } from "lucide-react"
 import { useState, useEffect, useRef } from "react"
 import { yelpAiService, type Business } from "@/services/yelpAi"
 import { pollStore, type Poll } from "@/services/pollStore"
 import { useParams, useSearchParams, useNavigate } from "react-router-dom"
 import { Modal } from "@/components/ui/modal"
 import { cn } from "@/lib/utils"
+import { useVoiceRecording, formatDuration } from "@/hooks/useVoiceRecording"
 
 type SwipeAction = {
     businessId: string
@@ -23,11 +24,26 @@ export function VoteSession() {
     const [poll, setPoll] = useState<Poll | undefined>(undefined)
     const [currentUser, setCurrentUser] = useState<string>("You")
 
-    const [chatInput, setChatInput] = useState("")
+    const [chatInput, setChatInput] = useState<string>("")
     const [searchResults, setSearchResults] = useState<Business[]>([])
     const [isSearching, setIsSearching] = useState(false)
     const [showResults, setShowResults] = useState(false)
     const [selectedBusiness, setSelectedBusiness] = useState<Business | null>(null)
+
+    // Voice recording
+    const {
+        isRecording,
+        isProcesing: isProcessingVoice,
+        recordingDuration,
+        startRecording,
+        stopRecording,
+        cancelRecording,
+        isSupported: isVoiceSupported
+    } = useVoiceRecording()
+
+    // Image upload
+    const [isProcessingImage, setIsProcessingImage] = useState(false)
+    const imageInputRef = useRef<HTMLInputElement>(null)
 
     // Swipe state
     const [currentCardIndex, setCurrentCardIndex] = useState(0)
@@ -37,13 +53,34 @@ export function VoteSession() {
     const [isDragging, setIsDragging] = useState(false)
     const cardRef = useRef<HTMLDivElement>(null)
 
-    // Initialize User Identity
+    // Initialize User Identity and capture location
     useEffect(() => {
         const userParam = searchParams.get('user')
         if (userParam) {
             setCurrentUser(userParam)
+
+            // Capture user's location when they join the session
+            if ('geolocation' in navigator && id) {
+                navigator.geolocation.getCurrentPosition(
+                    (position) => {
+                        pollStore.updateParticipantLocation(id, userParam, {
+                            lat: position.coords.latitude,
+                            lng: position.coords.longitude
+                        })
+                        console.log(`Location captured for ${userParam}`)
+                    },
+                    (error) => {
+                        console.warn('Could not capture user location:', error)
+                    },
+                    {
+                        enableHighAccuracy: true,
+                        timeout: 10000,
+                        maximumAge: 300000 // 5 minutes
+                    }
+                )
+            }
         }
-    }, [searchParams])
+    }, [searchParams, id])
 
     // Load poll data
     useEffect(() => {
@@ -63,8 +100,26 @@ export function VoteSession() {
         setShowResults(true)
 
         try {
-            const businesses = await yelpAiService.search(chatInput)
-            setSearchResults(businesses)
+            // Get user's location for better results
+            let location = await yelpAiService.getUserLocation()
+
+            // If location permission denied, use default location (San Francisco)
+            if (!location) {
+                console.warn('Location not available, using default location (San Francisco)')
+                location = {
+                    latitude: 37.7749,
+                    longitude: -122.4194
+                }
+            }
+
+            // Use multimodal search endpoint for text queries
+            const result = await yelpAiService.multimodalSearch({
+                textQuery: chatInput,
+                latitude: location.latitude,
+                longitude: location.longitude
+            })
+
+            setSearchResults(result.businesses || [])
         } catch (error) {
             console.error("Search failed", error)
         } finally {
@@ -160,24 +215,96 @@ export function VoteSession() {
         navigate(`/poll/${poll.id}/result`)
     }
 
-    const simulateVoiceInput = () => {
-        setIsSearching(true)
-        setShowResults(true)
-        setTimeout(() => {
-            setIsSearching(false)
-            setChatInput("Spicy Thai food")
-            handleSearch()
-        }, 1500)
+    const handleVoiceInput = async () => {
+        if (isRecording) {
+            // Stop recording and process
+            try {
+                const audioFile = await stopRecording()
+                if (!audioFile) return
+
+                setIsSearching(true)
+                setShowResults(true)
+
+                // Get user location with fallback
+                let location = await yelpAiService.getUserLocation()
+                if (!location) {
+                    location = { latitude: 37.7749, longitude: -122.4194 } // San Francisco default
+                }
+
+                // Use multimodal search - combines Gemini + Yelp in one call
+                const result = await yelpAiService.multimodalSearch({
+                    audioFile: audioFile,
+                    latitude: location.latitude,
+                    longitude: location.longitude
+                })
+
+                // Update UI with results
+                setChatInput(result.analysis?.transcription || result.search_query || "")
+                setSearchResults(result.businesses || [])
+                setIsSearching(false)
+
+            } catch (error) {
+                console.error('Voice processing error:', error)
+                setIsSearching(false)
+                const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+                alert(`Failed to process voice input: ${errorMessage}. Please try again.`)
+            }
+        } else {
+            // Start recording
+            try {
+                await startRecording()
+            } catch (error) {
+                console.error('Failed to start recording:', error)
+                alert('Microphone access denied. Please allow microphone access in your browser settings.')
+            }
+        }
     }
 
-    const simulateImageUpload = () => {
-        setIsSearching(true)
-        setShowResults(true)
-        setTimeout(() => {
+    const handleImageUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0]
+        if (!file) return
+
+        try {
+            setIsProcessingImage(true)
+            setIsSearching(true)
+            setShowResults(true)
+
+            // Get user location with fallback
+            let location = await yelpAiService.getUserLocation()
+            if (!location) {
+                location = { latitude: 37.7749, longitude: -122.4194 } // San Francisco default
+            }
+
+            // Use multimodal search - combines Gemini + Yelp in one call
+            const result = await yelpAiService.multimodalSearch({
+                imageFile: file,
+                latitude: location.latitude,
+                longitude: location.longitude
+            })
+
+            // Update UI with results
+            const description = result.analysis?.description?.substring(0, 50) || result.search_query
+            setChatInput(`Looking for: ${description}` || "")
+            setSearchResults(result.businesses || [])
             setIsSearching(false)
-            setChatInput("Sushi from image")
-            handleSearch()
-        }, 1500)
+            setIsProcessingImage(false)
+
+        } catch (error) {
+            console.error('Image processing error:', error)
+            setIsSearching(false)
+            setIsProcessingImage(false)
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred'
+            alert(`Failed to process image: ${errorMessage}. Please try again.`)
+        }
+
+        // Reset input
+        if (imageInputRef.current) {
+            imageInputRef.current.value = ''
+        }
+    }
+
+    const triggerImageUpload = () => {
+        imageInputRef.current?.click()
     }
 
     if (!poll) return <div className="flex items-center justify-center h-screen">Loading poll...</div>
@@ -485,6 +612,38 @@ export function VoteSession() {
                 )}
             </div>
 
+            {/* Recording Indicator Overlay */}
+            {isRecording && (
+                <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center z-50">
+                    <div className="bg-white rounded-2xl p-8 shadow-2xl max-w-sm mx-4 text-center">
+                        <div className="w-20 h-20 bg-red-500 rounded-full mx-auto mb-4 flex items-center justify-center relative">
+                            <Mic className="h-10 w-10 text-white" />
+                            <span className="absolute inset-0 rounded-full border-4 border-red-300 animate-ping" />
+                        </div>
+                        <h3 className="text-xl font-bold text-gray-900 mb-2">Listening...</h3>
+                        <p className="text-gray-600 mb-4">Speak your restaurant preferences</p>
+                        <div className="text-2xl font-mono text-red-600 mb-6">
+                            {formatDuration(recordingDuration)}
+                        </div>
+                        <div className="flex gap-3">
+                            <Button
+                                variant="outline"
+                                className="flex-1"
+                                onClick={() => cancelRecording()}
+                            >
+                                Cancel
+                            </Button>
+                            <Button
+                                className="flex-1 bg-red-500 hover:bg-red-600"
+                                onClick={handleVoiceInput}
+                            >
+                                Stop & Search
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
             {/* Floating Command Bar */}
             <div className="absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-white via-white/95 to-transparent pt-16 z-30">
                 <div className="max-w-3xl mx-auto relative">
@@ -547,14 +706,65 @@ export function VoteSession() {
                             }}
                         />
                         <div className="flex items-center gap-1 pr-1">
-                            <Button variant="ghost" size="icon" className="rounded-full text-gray-400 hover:text-gray-900 hover:bg-gray-100 transition-colors" onClick={simulateVoiceInput}>
-                                <Mic className="h-4 w-4" />
+                            {/* Voice Recording Button */}
+                            <div className="relative">
+                                <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    className={cn(
+                                        "rounded-full transition-all",
+                                        isRecording
+                                            ? "text-red-500 bg-red-50 hover:bg-red-100 animate-pulse"
+                                            : "text-gray-400 hover:text-gray-900 hover:bg-gray-100"
+                                    )}
+                                    onClick={handleVoiceInput}
+                                    disabled={isProcessingVoice || isSearching}
+                                >
+                                    {isProcessingVoice ? (
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                    ) : (
+                                        <Mic className="h-4 w-4" />
+                                    )}
+                                </Button>
+                                {isRecording && (
+                                    <span className="absolute -top-1 -right-1 w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+                                )}
+                            </div>
+
+                            {/* Image Upload Button */}
+                            <input
+                                ref={imageInputRef}
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                onChange={handleImageUpload}
+                            />
+                            <Button
+                                variant="ghost"
+                                size="icon"
+                                className="rounded-full text-gray-400 hover:text-gray-900 hover:bg-gray-100 transition-colors"
+                                onClick={triggerImageUpload}
+                                disabled={isProcessingImage || isSearching}
+                            >
+                                {isProcessingImage ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                    <ImageIcon className="h-4 w-4" />
+                                )}
                             </Button>
-                            <Button variant="ghost" size="icon" className="rounded-full text-gray-400 hover:text-gray-900 hover:bg-gray-100 transition-colors" onClick={simulateImageUpload}>
-                                <ImageIcon className="h-4 w-4" />
-                            </Button>
-                            <Button size="icon" className="rounded-full h-9 w-9 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 shadow-lg hover:shadow-xl transition-all" onClick={handleSearch} disabled={isSearching}>
-                                {isSearching ? <div className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Search className="h-4 w-4" />}
+
+                            {/* Search Button */}
+                            <Button
+                                size="icon"
+                                className="rounded-full h-9 w-9 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 shadow-lg hover:shadow-xl transition-all"
+                                onClick={handleSearch}
+                                disabled={isSearching || isProcessingVoice || isProcessingImage}
+                            >
+                                {isSearching ? (
+                                    <div className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                                ) : (
+                                    <Search className="h-4 w-4" />
+                                )}
                             </Button>
                         </div>
                     </div>

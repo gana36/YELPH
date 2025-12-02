@@ -2,17 +2,21 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
-import { MapPin, Clock, Phone, Star, Share2, Calendar, CheckCircle2, Navigation } from "lucide-react"
-import { useParams } from "react-router-dom"
+import { MapPin, Clock, Phone, Star, Share2, Calendar, CheckCircle2, Navigation, Loader2 } from "lucide-react"
+import { useParams, useLocation } from "react-router-dom"
 import { pollStore, type Poll } from "@/services/pollStore"
 import { useState, useEffect } from "react"
 import { type Business } from "@/services/yelpAi"
+import { openDirectionsFromCurrentLocation, openDirections, getGoogleMapsDirectionsUrl } from "@/lib/directionsHelper"
+import { calendarService } from "@/services/calendarService"
 
 export function PollResult() {
     const { id } = useParams()
+    const location = useLocation()
     const [poll, setPoll] = useState<Poll | undefined>(undefined)
     const [winner, setWinner] = useState<Business | undefined>(undefined)
     const [isBooked, setIsBooked] = useState(false)
+    const [isAddingToCalendar, setIsAddingToCalendar] = useState(false)
 
     useEffect(() => {
         const currentPoll = pollStore.getPoll(id || '1')
@@ -24,6 +28,115 @@ export function PollResult() {
             setWinner(sorted[0])
         }
     }, [id])
+
+    const handleGetDirections = async () => {
+        if (!winner?.coordinates) {
+            alert('Location coordinates not available for this restaurant')
+            return
+        }
+
+        try {
+            await openDirectionsFromCurrentLocation({
+                latitude: winner.coordinates.latitude,
+                longitude: winner.coordinates.longitude,
+                name: winner.name
+            })
+        } catch (error) {
+            console.error('Failed to open directions:', error)
+            alert('Failed to open directions. Please try again.')
+        }
+    }
+
+    const getDisplayAddress = (): string => {
+        if (winner?.location?.display_address && winner.location.display_address.length > 0) {
+            return winner.location.display_address.join(', ')
+        }
+        // Fallback address
+        return '123 Culinary Ave, Flavor Town, CA 90210'
+    }
+
+    const handleGetDirectionsForParticipant = (participantName: string) => {
+        if (!winner?.coordinates) {
+            alert('Location coordinates not available for this restaurant')
+            return
+        }
+
+        const participant = poll?.participants.find(p => p.name === participantName)
+
+        if (participant?.location) {
+            // Use participant's stored location
+            openDirections({
+                origin: {
+                    latitude: participant.location.lat,
+                    longitude: participant.location.lng
+                },
+                destination: {
+                    latitude: winner.coordinates.latitude,
+                    longitude: winner.coordinates.longitude,
+                    name: winner.name
+                }
+            })
+        } else {
+            // Fallback to current location
+            openDirectionsFromCurrentLocation({
+                latitude: winner.coordinates.latitude,
+                longitude: winner.coordinates.longitude,
+                name: winner.name
+            })
+        }
+    }
+
+    const handleAddToCalendar = async () => {
+        if (!winner || !poll) return
+
+        setIsAddingToCalendar(true)
+
+        try {
+            // Check if user is authenticated
+            if (!calendarService.isAuthenticated()) {
+                // Store current URL to return after auth
+                sessionStorage.setItem('calendar_return_url', location.pathname)
+
+                // Start OAuth flow
+                await calendarService.startAuth(poll.owner)
+                return
+            }
+
+            // Get directions URL
+            const directionsUrl = winner.coordinates
+                ? getGoogleMapsDirectionsUrl({
+                      destination: {
+                          latitude: winner.coordinates.latitude,
+                          longitude: winner.coordinates.longitude,
+                          name: winner.name
+                      }
+                  })
+                : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(winner.name)}`
+
+            // Create calendar event
+            const result = await calendarService.createRestaurantEvent(
+                winner.name,
+                getDisplayAddress(),
+                directionsUrl,
+                poll.participants.map(p => p.name)
+            )
+
+            setIsAddingToCalendar(false)
+
+            if (result.success) {
+                alert('✅ Event added to your Google Calendar!\n\nYou\'ll receive notifications before the event.')
+                if (result.event_link) {
+                    window.open(result.event_link, '_blank')
+                }
+            } else {
+                alert(`❌ Failed to add event: ${result.error}`)
+            }
+        } catch (error) {
+            setIsAddingToCalendar(false)
+            console.error('Error adding to calendar:', error)
+            alert('❌ An error occurred. Please try again.')
+        }
+    }
 
     if (!poll) return <div className="p-8 text-center">Loading poll...</div>
     if (!winner) return <div className="p-8 text-center">No votes yet! Go vote first.</div>
@@ -90,11 +203,18 @@ export function PollResult() {
                             <CardContent className="space-y-4">
                                 <div className="flex items-start gap-3">
                                     <MapPin className="h-5 w-5 text-gray-400 mt-1" />
-                                    <div>
-                                        <p className="font-medium text-gray-900">123 Culinary Ave, Flavor Town, CA 90210</p>
-                                        <p className="text-sm text-gray-500 mt-1">{winner.distance} away</p>
+                                    <div className="flex-1">
+                                        <p className="font-medium text-gray-900">{getDisplayAddress()}</p>
+                                        {winner.distance && (
+                                            <p className="text-sm text-gray-500 mt-1">{winner.distance} away</p>
+                                        )}
                                     </div>
-                                    <Button variant="outline" size="sm" className="ml-auto gap-2">
+                                    <Button
+                                        variant="outline"
+                                        size="sm"
+                                        className="ml-auto gap-2"
+                                        onClick={handleGetDirections}
+                                    >
                                         <Navigation className="h-4 w-4" /> Directions
                                     </Button>
                                 </div>
@@ -105,10 +225,14 @@ export function PollResult() {
                                         <p className="text-sm text-gray-500">Closes at 10:00 PM</p>
                                     </div>
                                 </div>
-                                <div className="flex items-start gap-3">
-                                    <Phone className="h-5 w-5 text-gray-400 mt-1" />
-                                    <p className="text-gray-900">(555) 123-4567</p>
-                                </div>
+                                {winner.phone && (
+                                    <div className="flex items-start gap-3">
+                                        <Phone className="h-5 w-5 text-gray-400 mt-1" />
+                                        <a href={`tel:${winner.phone}`} className="text-gray-900 hover:text-primary">
+                                            {winner.phone}
+                                        </a>
+                                    </div>
+                                )}
                             </CardContent>
                         </Card>
 
@@ -118,9 +242,18 @@ export function PollResult() {
                                 <CardTitle>Next Steps</CardTitle>
                             </CardHeader>
                             <CardContent className="grid gap-4 sm:grid-cols-2">
-                                <Button className="h-auto py-4 flex flex-col items-center gap-2" variant="outline">
-                                    <Calendar className="h-6 w-6 text-primary" />
-                                    <span>Add to Calendar</span>
+                                <Button
+                                    className="h-auto py-4 flex flex-col items-center gap-2"
+                                    variant="outline"
+                                    onClick={handleAddToCalendar}
+                                    disabled={isAddingToCalendar}
+                                >
+                                    {isAddingToCalendar ? (
+                                        <Loader2 className="h-6 w-6 text-primary animate-spin" />
+                                    ) : (
+                                        <Calendar className="h-6 w-6 text-primary" />
+                                    )}
+                                    <span>{isAddingToCalendar ? 'Adding...' : 'Add to Calendar'}</span>
                                 </Button>
                                 <Button className="h-auto py-4 flex flex-col items-center gap-2" variant="outline">
                                     <Share2 className="h-6 w-6 text-primary" />
@@ -167,19 +300,57 @@ export function PollResult() {
                             <CardContent>
                                 <div className="space-y-3">
                                     {poll.participants.map((p, i) => (
-                                        <div key={i} className="flex items-center justify-between">
-                                            <div className="flex items-center gap-3">
-                                                <Avatar className="h-8 w-8">
+                                        <div key={i} className="flex items-center justify-between gap-2">
+                                            <div className="flex items-center gap-3 flex-1 min-w-0">
+                                                <Avatar className="h-8 w-8 flex-shrink-0">
                                                     <AvatarFallback>{p.name[0]}</AvatarFallback>
                                                 </Avatar>
-                                                <span className="font-medium text-gray-900">{p.name}</span>
+                                                <div className="flex flex-col min-w-0">
+                                                    <span className="font-medium text-gray-900 truncate">{p.name}</span>
+                                                    {p.location && (
+                                                        <span className="text-xs text-gray-500">
+                                                            📍 Location saved
+                                                        </span>
+                                                    )}
+                                                </div>
                                             </div>
-                                            <Badge variant="outline" className="text-green-600 bg-green-50 border-green-200">
-                                                Confirmed
-                                            </Badge>
+                                            <Button
+                                                variant="ghost"
+                                                size="sm"
+                                                className="flex-shrink-0 h-8 w-8 p-0"
+                                                onClick={() => handleGetDirectionsForParticipant(p.name)}
+                                                title={`Get directions for ${p.name}`}
+                                            >
+                                                <Navigation className="h-4 w-4 text-blue-600" />
+                                            </Button>
                                         </div>
                                     ))}
                                 </div>
+                            </CardContent>
+                        </Card>
+
+                        {/* Group Directions */}
+                        <Card className="bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200">
+                            <CardHeader>
+                                <CardTitle className="flex items-center gap-2 text-blue-900">
+                                    <Navigation className="h-5 w-5" />
+                                    Get Directions
+                                </CardTitle>
+                            </CardHeader>
+                            <CardContent>
+                                <p className="text-sm text-blue-800 mb-3">
+                                    Everyone can get personalized directions to {winner.name}
+                                </p>
+                                <Button
+                                    className="w-full bg-blue-600 hover:bg-blue-700 text-white"
+                                    onClick={handleGetDirections}
+                                >
+                                    <Navigation className="h-4 w-4 mr-2" />
+                                    Open in Maps
+                                </Button>
+                                <p className="text-xs text-blue-600 mt-2 text-center">
+                                    Opens in your preferred maps app
+                                </p>
                             </CardContent>
                         </Card>
                     </div>

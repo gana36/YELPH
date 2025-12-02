@@ -1,5 +1,14 @@
 import { Business } from './yelpAi'
 
+export interface Participant {
+    name: string
+    voted: boolean
+    location?: {
+        lat: number
+        lng: number
+    }
+}
+
 export interface Poll {
     id: string
     title: string
@@ -7,7 +16,7 @@ export interface Poll {
     status: 'active' | 'completed'
     createdAt: string
     owner: string // Name of the creator
-    participants: { name: string, voted: boolean }[]
+    participants: Participant[]
     candidates: Business[]
     votes: Record<string, number> // businessId -> count
 }
@@ -115,6 +124,25 @@ class PollStore {
         if (candidate) candidate.votes++
 
         this.save()
+    }
+
+    updateParticipantLocation(pollId: string, userName: string, location: { lat: number; lng: number }) {
+        const poll = this.getPoll(pollId)
+        if (!poll) return
+
+        const participant = poll.participants.find(p => p.name === userName)
+        if (participant) {
+            participant.location = location
+            this.save()
+        }
+    }
+
+    getParticipantLocation(pollId: string, userName: string): { lat: number; lng: number } | undefined {
+        const poll = this.getPoll(pollId)
+        if (!poll) return undefined
+
+        const participant = poll.participants.find(p => p.name === userName)
+        return participant?.location
     }
 }
 
